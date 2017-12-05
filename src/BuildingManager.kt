@@ -2,26 +2,77 @@ import bwapi.Game
 import bwapi.TilePosition
 import bwapi.UnitType
 
-fun bwapi.Unit.isWorker() : Boolean {
+fun BwapiUnit.isWorker() : Boolean {
     return this.type != UnitType.Terran_SCV
             || this.type != UnitType.Zerg_Drone
             || this.type != UnitType.Protoss_Probe
 }
 
-fun bwapi.Unit.isBuilding() : Boolean {
+fun BwapiUnit.isBuilding() : Boolean {
     return this.type != UnitType.Terran_SCV &&
             this.type != UnitType.Terran_Dropship &&
             this.type != UnitType.Terran_Battlecruiser
 }
 
-class TerranBuildingManager(private val newBuildingLocator: NewBuildingLocator, private val game: Game) {
-    private val workers = mutableListOf<Builder>()
-    private val supplyDepots = mutableListOf<bwapi.Unit>()
+class ResourceManager : TerranBuilderManager.IListener {
+    private var mineralsAfterSpending = 0
+    private var gasAfterSpending = 0
 
-    private fun hasWorker(worker: bwapi.Unit) : Boolean {
+    var minerals = 0
+        set(value) {
+            val delta = value - field
+            mineralsAfterSpending += delta
+            field = value
+        }
+
+    var gas = 0
+        set(value) {
+            val delta = value - field
+            gasAfterSpending += delta
+            field = value
+        }
+
+    fun canAfford(unitType: UnitType) : Boolean {
+        return unitType.mineralPrice() <= mineralsAfterSpending
+                && unitType.gasPrice() <= gasAfterSpending
+    }
+
+    override fun spendResources(spentMinerals: Int, spentGas: Int) {
+        this.mineralsAfterSpending -= spentMinerals
+        this.gasAfterSpending -= spentGas
+    }
+
+    override fun refundResources(refundedMinerals: Int, refundedGas: Int) {
+        this.mineralsAfterSpending += refundedMinerals
+        this.gasAfterSpending += refundedGas
+    }
+
+    fun debug(game: Game) {
+        game.drawTextScreen(25, 25, "minerals: $minerals")
+        game.drawTextScreen(25, 50, "minerals after spending: $mineralsAfterSpending")
+        game.drawTextScreen(25, 75, "gas: $gas")
+        game.drawTextScreen(25, 125, "gas after spending: $gasAfterSpending")
+    }
+}
+
+class TerranBuilderManager(private val unitLocator: UnitLocator, private val game: Game) {
+    interface IListener {
+        fun spendResources(minerals: Int, gas: Int)
+        fun refundResources(minerals: Int, gas: Int)
+    }
+
+    private var callbacks: IListener? = null
+    fun setCallbacks(implementor: IListener?) {
+        callbacks = implementor
+    }
+
+    private val workers = mutableListOf<Builder>()
+    private val supplyDepots = mutableListOf<BwapiUnit>()
+
+    private fun hasWorker(worker: BwapiUnit) : Boolean {
         var hasWorker = false
         workers.forEach {
-            if (it.unit?.id == worker.id) {
+            if (it.unit.id == worker.id) {
                 hasWorker = true
                 return@forEach
             }
@@ -31,24 +82,20 @@ class TerranBuildingManager(private val newBuildingLocator: NewBuildingLocator, 
 
     fun workerCount() = "${workers.size} workers"
 
-    fun addWorker(worker: bwapi.Unit) : Boolean {
+    fun addWorker(worker: BwapiUnit) : Boolean {
         if (!worker.isWorker())
             throw IllegalStateException("You cannot add a unit of type ${worker.type}" +
                     " to the TerranBuildingManager's workers")
 
         if (!hasWorker(worker)) {
-            var homeBuilding: bwapi.Unit? = null
+            var homeBuilding: BwapiUnit? = null
             game.self().units.forEach {
                 if (it.type == UnitType.Terran_Command_Center) {
                     homeBuilding = it
                 }
             }
 
-            homeBuilding?.let {
-                workers.add(Builder(worker, it))
-                return true
-            }
-            return false
+            return workers.add(Builder(worker, homeBuilding ?: return false))
         } else {
             return false
         }
@@ -56,104 +103,144 @@ class TerranBuildingManager(private val newBuildingLocator: NewBuildingLocator, 
 
     fun buildSupplyDepot() : Boolean {
         val worker = workers.firstOrNull {
-            it.unit?.isBuilding() ?: false
+            !it.unit.isConstructing
         } ?: return false
 
-        if (worker is Builder) {
-            val location =
-                    newBuildingLocator
-                            .findSuitablePositionFor(UnitType.Terran_Supply_Depot, worker)
+        val location =
+                unitLocator
+                        .findSuitablePositionFor(UnitType.Terran_Supply_Depot, worker)
 
-            if (location === null)
-                return false
+        if (location === null)
+            return false
 
-            worker.unit?.let {
-                val built = it.build(UnitType.Terran_Supply_Depot, location)
-                val supplyDepot = it.target
-                supplyDepots.add(supplyDepot)
-                return built
+        val built = worker.unit.build(UnitType.Terran_Supply_Depot, location)
+        if (built) {
+            callbacks?.spendResources(UnitType.Terran_Supply_Depot.mineralPrice(),
+                    UnitType.Terran_Supply_Depot.gasPrice())
+
+            val supplyDepot = worker.unit.target
+            worker.buildingTask = supplyDepot.type
+            supplyDepots.add(supplyDepot)
+        }
+
+        return built
+    }
+
+    fun gatherMinerals() {
+        workers.forEach {
+            if(!it.unit.isGatheringMinerals
+                    && !it.unit.isGatheringGas
+                    && !it.buildingStarted()) {
+                it.unit.gather(unitLocator.findMineralFor(it))
             }
+        }
+    }
 
-            return false
-        } else {
-            return false
+    fun updateRefunds() {
+        workers.forEach { worker ->
+            if (worker.buildingStarted()) {
+                worker.buildingTask?.let {
+                    callbacks?.refundResources(it.mineralPrice(), it.gasPrice())
+                }
+                worker.buildingTask = null
+            }
         }
     }
 }
 
-class NewBuildingLocator(private val game: Game) {
+class UnitLocator(private val game: Game) {
 
-    fun findSuitablePositionFor(buildingType: UnitType, withBuilder: Builder) : TilePosition? {
-        val stopDistance = 40
-        var currentDistance = 3
+    fun findMineralFor(builder: Builder) : BwapiUnit? {
+        val buildersLocation = builder.unit.position
+        val mineralsInGame = game.minerals
 
-        val worker = withBuilder.unit ?: return null
-        val workersHome = withBuilder.home
-        val homePosition = workersHome?.position ?: return null
+        var smallestDistance = Int.MAX_VALUE
+        var closest = -1
+        for (i in 0..mineralsInGame.size - 1) {
+            val approxDistance = buildersLocation
+                    .getApproxDistance(mineralsInGame[i].position)
 
-        // Gas buildings
-        if (buildingType.isRefinery) {
-            game.neutralUnits.forEach { neutral ->
-                if (neutral.type == UnitType.Resource_Vespene_Geyser
-                        && Math.abs(neutral.position.x - homePosition.x) < stopDistance
-                        && Math.abs(neutral.position.y - homePosition.y) < stopDistance) {
-                    return neutral.tilePosition
-                }
+            if (approxDistance < smallestDistance) {
+                smallestDistance = approxDistance
+                closest = i
             }
         }
 
-        while (currentDistance < stopDistance) {
-            val left = homePosition.x - currentDistance
-            val right = homePosition.x + currentDistance
-            val bottom = homePosition.y - currentDistance
-            val top = homePosition.y + currentDistance
-
-            for (x in left..right) {
-                for (y in bottom..top) {
-                    var unitsInWay = false
-                    game.allUnits.forEach { unit ->
-                        if (unit.id != worker.id
-                                && Math.abs(unit.position.x - x) < 4
-                                && Math.abs(unit.position.y - y) < 4) {
-                            unitsInWay = true
-                        }
-                    }
-
-                    if (!unitsInWay)
-                        return TilePosition(x, y)
-                }
-            }
-            currentDistance += 2
+        if (closest != -1) {
+            return mineralsInGame[closest]
         }
         return null
     }
+
+    fun findSuitablePositionFor(buildingType: UnitType, withBuilder: Builder) : TilePosition? {
+        val ret: TilePosition? = null
+        var maxDist = 3
+        val stopDist = 40
+        val aroundTile = withBuilder.home.tilePosition
+        val builderUnit = withBuilder.unit
+
+        // Refinery, Assimilator, Extractor
+        if (buildingType.isRefinery) {
+            for (n in game.neutral().units) {
+                if (n.type === UnitType.Resource_Vespene_Geyser &&
+                        Math.abs(n.tilePosition.x - aroundTile.x) < stopDist &&
+                        Math.abs(n.tilePosition.y - aroundTile.y) < stopDist)
+                    return n.tilePosition
+            }
+        }
+
+        while (maxDist < stopDist && ret == null) {
+            for (i in aroundTile.x - maxDist..aroundTile.x + maxDist) {
+                for (j in aroundTile.y - maxDist..aroundTile.y + maxDist) {
+                    if (game.canBuildHere(TilePosition(i, j), buildingType, builderUnit, false)) {
+                        // units that are blocking the tile
+                        var unitsInWay = false
+                        for (u in game.allUnits) {
+                            if (u.id == builderUnit.id) continue
+                            if (Math.abs(u.tilePosition.x - i) < 4 && Math.abs(u.tilePosition.y - j) < 4) unitsInWay = true
+                        }
+                        if (!unitsInWay) {
+                            return TilePosition(i, j)
+                        }
+                        // creep for Zerg
+                        if (buildingType.requiresCreep()) {
+                            var creepMissing = false
+                            for (k in i..i + buildingType.tileWidth()) {
+                                for (l in j..j + buildingType.tileHeight()) {
+                                    if (!game.hasCreep(k, l)) creepMissing = true
+                                    break
+                                }
+                            }
+                            if (creepMissing) continue
+                        }
+                    }
+                }
+            }
+            maxDist += 2
+        }
+
+        return ret
+    }
 }
 
-class Builder {
-    // A reference to the unit
-    var unit: bwapi.Unit?
+class Builder(var unit: BwapiUnit, var home: BwapiUnit) {
 
-    // A reference to the building that is this builders home
-    var home: bwapi.Unit?
+    var buildingTask: UnitType? = null
 
-    constructor(unit: bwapi.Unit,
-                home: bwapi.Unit) {
-        // Check the unit type is a worker
+    init {
         if (!unit.isWorker())
             throw IllegalStateException("A builder cannot be created with unit type ${unit.type}")
-
-        // Check the home is a building
-        if (!unit.isBuilding())
+        if (!home.isBuilding())
             throw IllegalStateException("A builder cannot be created with home type ${home.type}")
-
-        // Set the state
-        this.unit = unit
-        this.home = home
     }
 
-    fun migrateToNewHome(newHome: bwapi.Unit) : Boolean {
+    fun migrateToNewHome(newHome: BwapiUnit) : Boolean {
         if (!newHome.isBuilding())
             throw IllegalStateException("A builder cannot migrate to a unit with type ${newHome.type}")
         return false
+    }
+
+    fun buildingStarted() : Boolean {
+        return buildingTask !== null && unit.isConstructing
     }
 }

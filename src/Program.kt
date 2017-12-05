@@ -1,12 +1,14 @@
 import bwapi.*
 import bwta.BWTA
+typealias BwapiUnit = bwapi.Unit
 
 class Program : DefaultBWListener() {
 
     private val mirror = Mirror()
-    private var game: Game? = null
-    private var self: Player? = null
-    private var buildingManager: TerranBuildingManager? = null
+    private lateinit var game: Game
+    private lateinit var self: Player
+    private lateinit var builderManager: TerranBuilderManager
+    private lateinit var resourceManager: ResourceManager
 
     fun run() {
         mirror.module.setEventListener(this)
@@ -15,28 +17,32 @@ class Program : DefaultBWListener() {
 
     override fun onStart() {
         game = mirror.game
-        self = game!!.self()
+        self = game.self()
 
-        game?.let {
-            buildingManager = TerranBuildingManager(NewBuildingLocator(it), it)
+        builderManager = TerranBuilderManager(UnitLocator(game), game)
+        resourceManager = ResourceManager()
+        builderManager.setCallbacks(resourceManager)
+
+        self.units.forEach {
+            builderManager.addWorker(it)
         }
-
-
 
         BWTA.readMap()
         BWTA.analyze()
     }
 
     override fun onFrame() {
-        (self as Player).units.forEach {
-            buildingManager?.addWorker(it)
-        }
+        resourceManager.minerals = self.minerals()
+        resourceManager.gas = self.gas()
 
-        buildingManager?.let {
-            it.buildSupplyDepot()
-            game?.drawTextScreen(25, 50, it.workerCount())
+        if (resourceManager.canAfford(UnitType.Terran_Supply_Depot)) {
+            builderManager.buildSupplyDepot()
         }
-        game?.drawTextScreen(25, 25, "Test")
+        builderManager.gatherMinerals()
+        builderManager.updateRefunds()
+
+        resourceManager.debug(game)
+        game.drawTextScreen(25, 150, builderManager.workerCount())
     }
 
     companion object {
